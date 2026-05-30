@@ -21,11 +21,13 @@ from rangarr.clients.arr import ReadarrClient
 from rangarr.clients.arr import SonarrClient
 from rangarr.clients.arr import WhisparrV2Client
 from rangarr.clients.arr import WhisparrV3Client
+from rangarr.api import start_api_server
 from rangarr.config_parser import SETTINGS_SCHEMA
 from rangarr.config_parser import get_setting_default
 from rangarr.config_parser import load_config
 from rangarr.config_parser import load_config_from_env
 from rangarr.config_parser import parse_active_hours
+from rangarr.stats import stats
 
 if 'TZ' not in os.environ:
     os.environ['TZ'] = 'UTC'
@@ -333,6 +335,7 @@ def _run_search_cycle(
 ) -> None:
     """Run a single search cycle across all active clients using global allocation."""
     logger.info('--- Starting search cycle ---')
+    stats.update(status='searching')
 
     global_missing = _get_setting(settings, 'missing_batch_size') if run_missing else 0
     global_upgrade = _get_setting(settings, 'upgrade_batch_size') if run_upgrade else 0
@@ -360,6 +363,7 @@ def _run_search_cycle(
 
     if not final_queue:
         logger.info('No media to search this cycle across all instances.')
+        stats.update(status='idle')
         return
 
     logger.info(
@@ -373,6 +377,9 @@ def _run_search_cycle(
         if stagger_seconds > 0 and index < len(final_queue):
             logger.debug(f'Staggering next search by {stagger_seconds}s.')
             time.sleep(stagger_seconds)
+
+    stats.increment_searches(len(final_queue))
+    stats.update(status='idle', last_cycle_at=datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
 
 
 def _seconds_until_window_open(start: datetime.time, now: datetime.time, today: datetime.date | None = None) -> int:
@@ -457,6 +464,14 @@ def run() -> None:
         sys.exit(1)
 
     _log_rangarr_start(active_clients, settings)
+    start_api_server()
+
+    stats.update(
+        status='idle',
+        instances=len(active_clients),
+        instance_names=[c.name for c in active_clients],
+        dry_run=_get_setting(settings, 'dry_run'),
+    )
 
     missing_interval_secs = _resolve_interval_secs(settings, 'run_interval_minutes_missing')
     upgrade_interval_secs = _resolve_interval_secs(settings, 'run_interval_minutes_upgrade')
@@ -488,21 +503,19 @@ def run() -> None:
         _run_search_cycle(active_clients, settings, run_missing=run_missing, run_upgrade=run_upgrade)
 
         now = time.monotonic()
+        next_missing_secs = missing_interval_secs - (now - last_missing_run)
+        next_upgrade_secs = upgrade_interval_secs - (now - last_upgrade_run)
         logger.info(
-            _format_cycle_complete_log(
-                run_missing,
-                run_upgrade,
-                missing_interval_secs - (now - last_missing_run),
-                upgrade_interval_secs - (now - last_upgrade_run),
-            )
+            _format_cycle_complete_log(run_missing, run_upgrade, next_missing_secs, next_upgrade_secs)
+        )
+        stats.update(
+            next_missing_in=f'{max(0, math.ceil(next_missing_secs / 60))}m',
+            next_upgrade_in=f'{max(0, math.ceil(next_upgrade_secs / 60))}m',
         )
         time.sleep(
             max(
                 _MIN_SLEEP_SECONDS,
-                min(
-                    missing_interval_secs - (now - last_missing_run),
-                    upgrade_interval_secs - (now - last_upgrade_run),
-                ),
+                min(next_missing_secs, next_upgrade_secs),
             )
         )
 
